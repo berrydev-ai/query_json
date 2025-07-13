@@ -1,5 +1,6 @@
 package main
 
+// Test comment for pre-commit hook
 import (
 	"encoding/json"
 	"flag"
