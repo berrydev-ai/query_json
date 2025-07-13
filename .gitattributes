@@ -1,0 +1,18 @@
+# Ensure consistent line endings across platforms
+* text=auto
+
+# Go source files should always use LF
+*.go text eol=lf
+
+# Shell scripts should use LF
+*.sh text eol=lf
+
+# Windows batch files should use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
