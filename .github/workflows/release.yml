@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test Before Release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    
+    - name: Run tests
+      run: go test -v ./...
+    
+    - name: Run integration tests
+      run: |
+        go build -o query_json
+        echo '{"test": "data"}' > test.json
+        ./query_json --query '$.test' test.json  | grep -q "data"
+        echo "Integration tests passed!"
+
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    
+    - name: Get version from tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+        echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Get build info
+      id: build_info
+      run: |
+        BUILD_DATE=$(date -u '+%Y-%m-%d_%H:%M:%S_UTC')
+        GIT_COMMIT=$(git rev-parse --short HEAD)
+        echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_OUTPUT
+        echo "GIT_COMMIT=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+    
+    - name: Build binaries
+      env:
+        VERSION: ${{ steps.version.outputs.VERSION }}
+        BUILD_DATE: ${{ steps.build_info.outputs.BUILD_DATE }}
+        GIT_COMMIT: ${{ steps.build_info.outputs.GIT_COMMIT }}
+      run: |
+        mkdir -p builds
+        
+        # Build flags with version information
+        LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${GIT_COMMIT} -X main.date=${BUILD_DATE}"
+        
+        # Build for multiple platforms
+        platforms=(
+          "windows/amd64"
+          "windows/386" 
+          "darwin/amd64"
+          "darwin/arm64"
+          "linux/amd64"
+          "linux/386"
+          "linux/arm64"
+          "linux/arm"
+        )
+        
+        for platform in "${platforms[@]}"; do
+          platform_split=(${platform//\// })
+          GOOS=${platform_split[0]}
+          GOARCH=${platform_split[1]}
+          
+          output_name="query_json-${GOOS}-${GOARCH}"
+          if [ $GOOS = "windows" ]; then
+            output_name+='.exe'
+          fi
+          
+          echo "Building $output_name..."
+          env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o builds/$output_name
+          
+          if [ $? -ne 0 ]; then
+            echo "An error has occurred! Aborting the script execution..."
+            exit 1
+          fi
+        done
+    
+    - name: Generate checksums
+      run: |
+        cd builds
+        sha256sum * > checksums.sha256
+        sha512sum * > checksums.sha512
+        cd ..
+    
+    - name: Create release archive
+      run: |
+        # Create source archive
+        git archive --format=tar.gz --prefix=query_json-${{ steps.version.outputs.VERSION }}/ HEAD > builds/query_json-${{ steps.version.outputs.VERSION }}-source.tar.gz
+        
+        # Create binary archives for each platform
+        cd builds
+        for file in query_json-*; do
+          if [[ $file != *.tar.gz ]] && [[ $file != *.sha* ]]; then
+            if [[ $file == *windows* ]]; then
+              zip "${file%.exe}.zip" "$file" ../README.md ../LICENSE
+            else
+              tar -czf "${file}.tar.gz" "$file" ../README.md ../LICENSE
+            fi
+          fi
+        done
+        cd ..
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Generate changelog from git commits since last tag
+        LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges)
+        else
+          COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges ${LAST_TAG}..HEAD)
+        fi
+        
+        # Create changelog
+        cat > CHANGELOG.md << EOF
+        ## What's Changed
+        
+        ${COMMITS}
+        
+        ## Binary Downloads
+        
+        | Platform | Architecture | Download |
+        |----------|-------------|----------|
+        | Windows | x64 | [query_json-windows-amd64.exe](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-windows-amd64.exe) |
+        | Windows | x86 | [query_json-windows-386.exe](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-windows-386.exe) |
+        | macOS | Intel | [query_json-darwin-amd64](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-darwin-amd64) |
+        | macOS | Apple Silicon | [query_json-darwin-arm64](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-darwin-arm64) |
+        | Linux | x64 | [query_json-linux-amd64](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-linux-amd64) |
+        | Linux | x86 | [query_json-linux-386](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-linux-386) |
+        | Linux | ARM64 | [query_json-linux-arm64](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-linux-arm64) |
+        | Linux | ARM | [query_json-linux-arm](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/query_json-linux-arm) |
+        
+        ## Installation
+        
+        ### Direct Download
+        1. Download the appropriate binary for your platform from the links above
+        2. Make it executable (Unix/Linux/macOS): \`chmod +x query_json-*\`
+        3. Optionally, move to your PATH: \`mv query_json-* /usr/local/bin/query_json\`
+        
+        ### Via Go
+        \`\`\`bash
+        go install github.com/berrydev-ai/query_json@${{ steps.version.outputs.TAG }}
+        \`\`\`
+        
+        ## Usage
+        \`\`\`bash
+        query_json data.json --query '\$.users[*].name'
+        \`\`\`
+        
+        For more examples, see the [README](https://github.com/berrydev-ai/query_json#readme).
+        
+        ## Checksums
+        - SHA256: [checksums.sha256](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/checksums.sha256)
+        - SHA512: [checksums.sha512](https://github.com/berrydev-ai/query_json/releases/download/${{ steps.version.outputs.TAG }}/checksums.sha512)
+        EOF
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.TAG }}
+        name: Release ${{ steps.version.outputs.TAG }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: false
+        files: |
+          builds/*
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Update latest release
+      run: |
+        echo "Release ${{ steps.version.outputs.TAG }} created successfully!"
+        echo "Download URL: https://github.com/berrydev-ai/query_json/releases/tag/${{ steps.version.outputs.TAG }}"
